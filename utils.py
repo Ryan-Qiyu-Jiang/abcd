@@ -1,3 +1,6 @@
+import sys
+sys.path.append("./rloss/pytorch/pytorch-deeplab_v3_plus")
+
 from dataloaders.utils import decode_seg_map_sequence
 
 segmentation_classes = [
