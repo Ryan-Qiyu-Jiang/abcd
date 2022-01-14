@@ -175,18 +175,24 @@ class ColorDecoder(nn.Module):
     if log_num % 10 == 0:
       wandb.log(d, commit=commit)
 
-  def forward(self, feature_map, x):
+  def forward(self, feature_map, x, low=None):
+    image = x
+    x = x.permute(0,2,3,1) # bs, 3, h, w -> bs, h, w, 3
+    if low is not None:
+      low = F.interpolate(low, size=image.size()[2:], mode='bilinear', align_corners=True)
+      x = torch.concat([x, low], dim=-1)
+    
+    x_dim = x.size(-1)
     logits_map = self.coarse_cls(feature_map) # c
     coarse_segments = self.softmax(logits_map) # bs, h, w, num_classes, dim(x) = bs, h, w, 3
-    coarse_segments = F.interpolate(coarse_segments, size=x.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, h, w, num_classes
+    coarse_segments = F.interpolate(coarse_segments, size=image.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, h, w, num_classes
     # sanity check
     mask = torch.max(coarse_segments[:1],1)[1].detach()
-    mask = wandb.Image(x[0].cpu().numpy().transpose([1,2,0]), masks={
+    mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
       "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
     self.log({'debug/coarse_segments': mask}, commit=False)
 
-    x = x.permute(0,2,3,1) # bs, 3, h, w -> bs, h, w, 3
-    image_segments_masked =  [  x * coarse_segments[::,i].unsqueeze(-1).expand(-1,-1,-1,3) for i in range(self.num_classes) ] # num_classes x (bs, h, w, 3)
+    image_segments_masked =  [  x * coarse_segments[::,i].unsqueeze(-1).expand(-1,-1,-1,x_dim) for i in range(self.num_classes) ] # num_classes x (bs, h, w, 3)
     # sanity check
     self.log({'debug/image_segments_masked': to_img(image_segments_masked[0][0])}, commit=False)
 
@@ -201,13 +207,14 @@ class ColorDecoder(nn.Module):
     segments_by_color = torch.cat([a.unsqueeze(1) for a in attn_maps],  dim=1) # bs, num_classes, h, w
     # sanity check
     mask = torch.max(segments_by_color[:1],1)[1].detach()
-    mask = wandb.Image(x[0].cpu().numpy(), masks={
+    mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
       "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
     self.log({'debug/finer_segments': mask}, commit=False)
 
     global log_num
     log_num += 1
     return segments_by_color
+
 
 class SimpleColorDecoder(nn.Module):
   def __init__(self, num_classes=21, feature_dim=256):
@@ -227,6 +234,7 @@ class SimpleColorDecoder(nn.Module):
     attn_maps = [ torch.sum(x * q[i].unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), x.size(2), -1), dim=-1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
     segments_by_color = torch.cat([a.unsqueeze(1) for a in attn_maps],  dim=1) # bs, num_classes, h, w
     return segments_by_color
+
 
 class ColorModel(BaseModel):
     def __init__(self, hparams, encoder=None):
