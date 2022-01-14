@@ -209,6 +209,24 @@ class ColorDecoder(nn.Module):
     log_num += 1
     return segments_by_color
 
+class SimpleColorDecoder(nn.Module):
+  def __init__(self, num_classes=21, feature_dim=256):
+    super().__init__()
+    self.num_classes = num_classes
+    self.feature_dim = feature_dim
+    self.softmax = nn.Softmax(dim=1)
+    self.coarse_cls = nn.Conv2d(feature_dim, num_classes, kernel_size=1, stride=1)
+
+  def forward(self, feature_map, x):
+    logits_map = self.coarse_cls(feature_map) # c
+    coarse_segments = self.softmax(logits_map) # bs, h, w, num_classes, dim(x) = bs, h, w, 3
+    coarse_segments = F.interpolate(coarse_segments, size=x.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, h, w, num_classes
+    x = x.permute(0,2,3,1) # bs, 3, h, w -> bs, h, w, 3
+    image_segments_masked =  [  x * coarse_segments[::,i].unsqueeze(-1).expand(-1,-1,-1,3) for i in range(self.num_classes) ] # num_classes x (bs, h, w, 3)
+    q = [ torch.mean(s, dim=(1,2)) for s in image_segments_masked ] # mean color of the segment, num_classes x (bs, 3)
+    attn_maps = [ torch.sum(x * q[i].unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), x.size(2), -1), dim=-1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
+    segments_by_color = torch.cat([a.unsqueeze(1) for a in attn_maps],  dim=1) # bs, num_classes, h, w
+    return segments_by_color
 
 class ColorModel(BaseModel):
     def __init__(self, hparams, encoder=None):
