@@ -157,8 +157,11 @@ class BaseModel(pl.LightningModule):
         print('Loss: %.3f' % test_loss)
 
 
-import wandb
+import pdb
+
 def to_img(img_tensor, **kwargs):
+  if img_tensor.size(0) == 3:
+    img_tensor = img_tensor.permute(1, 2, 0) # 3 h w -> h w 3
   return wandb.Image((img_tensor.cpu().detach().numpy() * 255).astype(np.uint8), **kwargs)
 log_num = 0
 
@@ -177,64 +180,61 @@ class ColorDecoder(nn.Module):
 
   def forward(self, feature_map, x, low=None):
     image = x
-    x = x.permute(0,2,3,1) # bs, 3, h, w -> bs, h, w, 3
+    # pdb.set_trace()
     if low is not None:
-      low = F.interpolate(low, size=image.size()[2:], mode='bilinear', align_corners=True)
-      x = torch.concat([x, low], dim=-1)
+      low = F.interpolate(low, size=image.size()[2:], mode='bilinear', align_corners=True) # bs, num_channels, h, w
+      x = torch.concat([x, low], dim=1) # bs, (num_channels+3 = d), h, w
     
-    x_dim = x.size(-1)
+    x_dim = x.size(1)
     logits_map = self.coarse_cls(feature_map) # c
-    coarse_segments = self.softmax(logits_map) # bs, h, w, num_classes, dim(x) = bs, h, w, 3
-    coarse_segments = F.interpolate(coarse_segments, size=image.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, h, w, num_classes
+    coarse_segments = self.softmax(logits_map) # bs, num_classes, h, w,  dim(x) = bs, h, w, d
+    coarse_segments = F.interpolate(coarse_segments, size=image.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, num_classes, h, w
     # sanity check
-    mask = torch.max(coarse_segments[:1],1)[1].detach()
-    mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
-      "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
-    self.log({'debug/coarse_segments': mask}, commit=False)
+    with torch.no_grad():
+      mask = torch.max(coarse_segments[:1],1)[1].detach()
+      mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
+        "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
+      self.log({'debug/coarse_segments': mask}, commit=False)
+    
+    image_segments_masked =  [  x * coarse_segments[:,i].unsqueeze(1).expand(-1,x_dim,-1,-1) for i in range(self.num_classes) ] # num_classes x (bs, d, h, w)
+    # sanity check
+    with torch.no_grad():
+      self.log({'debug/image_segments_masked': to_img(image_segments_masked[0][0][:3,:,:]/coarse_segments[0,0].sum() )}, commit=False)
 
-    image_segments_masked =  [  x * coarse_segments[::,i].unsqueeze(-1).expand(-1,-1,-1,x_dim) for i in range(self.num_classes) ] # num_classes x (bs, h, w, 3)
+    q = [ torch.mean(s, dim=(2,3)) for s in image_segments_masked ] # mean color of the segment, num_classes x (bs, d)
     # sanity check
-    self.log({'debug/image_segments_masked': to_img(image_segments_masked[0][0])}, commit=False)
+    with torch.no_grad():
+      self.log({'debug/query': [to_img(q[i][0][:3].unsqueeze(0).unsqueeze(0).expand(50, 50,-1)/coarse_segments[0,i].sum(), caption=segmentation_classes[i]) for i in range(self.num_classes)]}, commit=False)
 
-    q = [ torch.mean(s, dim=(1,2)) for s in image_segments_masked ] # mean color of the segment, num_classes x (bs, 3)
+    attn_maps = [ torch.sum(x * q[i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, x.size(2), x.size(3)), dim=1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
     # sanity check
-    self.log({'debug/query': [to_img(q[i][0].unsqueeze(0).unsqueeze(0).expand(50, 50,-1), caption=segmentation_classes[i]) for i in range(self.num_classes)]}, commit=False)
-
-    attn_maps = [ torch.sum(x * q[i].unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), x.size(2), -1), dim=-1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
-    # sanity check
-    self.log({'debug/attn_maps': [to_img(attn_maps[i][0], caption=segmentation_classes[i]) for i in range(self.num_classes)] }, commit=False)
+    with torch.no_grad():
+      self.log({'debug/attn_maps': [to_img(attn_maps[i][0], caption=segmentation_classes[i]) for i in range(self.num_classes)] }, commit=False)
 
     segments_by_color = torch.cat([a.unsqueeze(1) for a in attn_maps],  dim=1) # bs, num_classes, h, w
     # sanity check
-    mask = torch.max(segments_by_color[:1],1)[1].detach()
-    mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
-      "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
-    self.log({'debug/finer_segments': mask}, commit=False)
+    with torch.no_grad():
+      mask = torch.max(segments_by_color[:1],1)[1].detach()
+      mask = wandb.Image(image[0].cpu().numpy().transpose([1,2,0]), masks={
+        "prediction" : {"mask_data" : mask[0].cpu().numpy(), "class_labels" : labels()}})
+      self.log({'debug/finer_segments': mask}, commit=False)
 
     global log_num
     log_num += 1
     return segments_by_color
 
-
-class SimpleColorDecoder(nn.Module):
-  def __init__(self, num_classes=21, feature_dim=256):
+class DeepLabEncoder(nn.Module):
+  def __init__(self, hparams):
     super().__init__()
-    self.num_classes = num_classes
-    self.feature_dim = feature_dim
-    self.softmax = nn.Softmax(dim=1)
-    self.coarse_cls = nn.Conv2d(feature_dim, num_classes, kernel_size=1, stride=1)
-
-  def forward(self, feature_map, x):
-    logits_map = self.coarse_cls(feature_map) # c
-    coarse_segments = self.softmax(logits_map) # bs, h, w, num_classes, dim(x) = bs, h, w, 3
-    coarse_segments = F.interpolate(coarse_segments, size=x.size()[2:], mode='bilinear', align_corners=True) # s, dim(s) = bs, h, w, num_classes
-    x = x.permute(0,2,3,1) # bs, 3, h, w -> bs, h, w, 3
-    image_segments_masked =  [  x * coarse_segments[::,i].unsqueeze(-1).expand(-1,-1,-1,3) for i in range(self.num_classes) ] # num_classes x (bs, h, w, 3)
-    q = [ torch.mean(s, dim=(1,2)) for s in image_segments_masked ] # mean color of the segment, num_classes x (bs, 3)
-    attn_maps = [ torch.sum(x * q[i].unsqueeze(1).unsqueeze(2).expand(-1, x.size(1), x.size(2), -1), dim=-1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
-    segments_by_color = torch.cat([a.unsqueeze(1) for a in attn_maps],  dim=1) # bs, num_classes, h, w
-    return segments_by_color
-
+    self.hparams = hparams
+    self.model = DeepLab(num_classes=self.hparams.nclass,
+                                backbone=self.hparams.backbone,
+                                output_stride=self.hparams.out_stride,
+                                sync_bn=self.hparams.sync_bn,
+                                freeze_bn=self.hparams.freeze_bn)
+  def forward(self, x):
+    x, low_level = self.model.backbone(x)
+    return self.model.aspp(x), low_level
 
 class ColorModel(BaseModel):
     def __init__(self, hparams, encoder=None):
@@ -247,11 +247,51 @@ class ColorModel(BaseModel):
                             freeze_bn=self.hparams.freeze_bn)
           encoder = model.backbone
         self.encoder = encoder
-        self.decoder = ColorDecoder(num_classes=self.hparams.nclass, feature_dim=320) # resnet feature map dim
+        self.decoder = ColorDecoder(num_classes=self.hparams.nclass, feature_dim=256) # resnet feature map dim 320, aspp=256
         
     def forward(self, x):
-      feature_map, _ = self.encoder(x)
-      return self.decoder(feature_map, x)
+      feature_map, low_level_feats = self.encoder(x)
+      return self.decoder(feature_map, x, low=low_level_feats)
+
+    def get_loss(self, batch, batch_idx):
+            i = batch_idx
+            epoch = self.current_epoch
+            image, target = batch['image'], batch['label']
+            target[target==254]=255
+            self.scheduler(self.optimizer, i, epoch, self.best_pred)
+            self.optimizer.zero_grad()
+            output = self.forward(image)
+            celoss = self.criterion(output, target.long())
+
+            x, _ = self.encoder(image)
+            coarse_output = self.decoder.coarse_cls(x)
+            coarse_output = F.interpolate(coarse_output, size=image.size()[2:], mode='bilinear', align_corners=True)
+            coarse_celoss = self.criterion(coarse_output, target.long())
+
+            return celoss + coarse_celoss*0.1
+    
+    def get_loss_val(self, batch, batch_idx):
+            image, target = batch['image'], batch['label']
+            target[target==254]=255
+            output = self.forward(image)
+            celoss = self.criterion(output, target.long())
+            mask = torch.max(output[:1],1)[1].detach()
+            self.val_img_logs += [wb_mask(image[0].cpu().numpy().transpose([1,2,0]), mask[0].cpu().numpy(), target[0].cpu().numpy())]
+
+            x, _ = self.encoder(image)
+            coarse_output = self.decoder.coarse_cls(x)
+            coarse_output = F.interpolate(coarse_output, size=image.size()[2:], mode='bilinear', align_corners=True)
+            mask = torch.max(coarse_output[:1],1)[1].detach()
+            self.val_img_logs += [wb_mask(image[0].cpu().numpy().transpose([1,2,0]), mask[0].cpu().numpy(), target[0].cpu().numpy())]
+
+            pred = output.data.cpu().numpy()
+            pred = np.argmax(pred, axis=1)
+            target = target.cpu().numpy()
+            self.evaluator.add_batch(target, pred)
+            result = {
+              'ce_loss': celoss
+            }
+            return result
 
     def configure_optimizers(self):
         train_params = [{'params': self.get_1x_lr_params(), 'lr': self.hparams.lr},
@@ -264,7 +304,7 @@ class ColorModel(BaseModel):
         return self.optimizer
 
     def get_1x_lr_params(self):
-        modules = [self.encoder]
+        modules = [self.encoder.model.backbone]
         for i in range(len(modules)):
             for m in modules[i].named_modules():
                 if isinstance(m[1], nn.Conv2d) or isinstance(m[1], SynchronizedBatchNorm2d) \
@@ -274,7 +314,7 @@ class ColorModel(BaseModel):
                             yield p
 
     def get_10x_lr_params(self):
-        modules = [self.decoder]
+        modules = [self.decoder, self.encoder.model.aspp]
         for i in range(len(modules)):
             for m in modules[i].named_modules():
                 if isinstance(m[1], nn.Conv2d) or isinstance(m[1], SynchronizedBatchNorm2d) \
