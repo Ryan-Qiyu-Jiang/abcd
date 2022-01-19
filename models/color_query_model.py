@@ -197,14 +197,12 @@ class ColorDecoder(nn.Module):
       self.log({'debug/coarse_segments': mask}, commit=False)
     
     image_segments_masked =  [  x * coarse_segments[:,i].unsqueeze(1).expand(-1,x_dim,-1,-1) for i in range(self.num_classes) ] # num_classes x (bs, d, h, w)
-    # sanity check
-    with torch.no_grad():
-      self.log({'debug/image_segments_masked': to_img(image_segments_masked[0][0][:3,:,:]/coarse_segments[0,0].sum() )}, commit=False)
 
     q = [ torch.mean(s, dim=(2,3)) for s in image_segments_masked ] # mean color of the segment, num_classes x (bs, d)
+    
     # sanity check
     with torch.no_grad():
-      self.log({'debug/query': [to_img(q[i][0][:3].unsqueeze(0).unsqueeze(0).expand(50, 50,-1)/coarse_segments[0,i].sum(), caption=segmentation_classes[i]) for i in range(self.num_classes)]}, commit=False)
+      self.log({'debug/query': [to_img(q[i][0][:3].unsqueeze(0).unsqueeze(0).expand(50, 50,-1)/coarse_segments[0,i].sum()*(image.size(-1)**2), caption=segmentation_classes[i]) for i in range(self.num_classes)]}, commit=False)
 
     attn_maps = [ torch.sum(x * q[i].unsqueeze(-1).unsqueeze(-1).expand(-1, -1, x.size(2), x.size(3)), dim=1) for i in range(self.num_classes) ] # num_classes x  (bs, h, w)
     # sanity check
@@ -322,4 +320,3 @@ class ColorModel(BaseModel):
                     for p in m[1].parameters():
                         if p.requires_grad:
                             yield p
-
